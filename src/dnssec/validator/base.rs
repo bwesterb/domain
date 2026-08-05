@@ -331,6 +331,38 @@ pub fn supported_algorithm(a: &SecurityAlgorithm) -> bool {
         || *a == SecurityAlgorithm::ECDSAP256SHA256
 }
 
+/// Report whether the validator insists on an algorithm when a zone
+/// advertises it.
+///
+/// Section 5.11 of [RFC 6840] recommends validators to accept any single
+/// valid path. Such lenient validators are vulnerable to a downgrade
+/// attack: if a zone is signed by both a quantum-resistant and a
+/// quantum-vulnerable algorithm, then a quantum attacker can strip the
+/// quantum-resistant signatures and have the lenient validator accept a
+/// forged quantum-vulnerable signature.
+///
+/// As suggested in the Security Considerations of
+/// [draft-westerbaan-dnssec-mldsa], the validator evades this downgrade by
+/// insisting on the presence of a valid ML-DSA-44 signature when the
+/// availability of ML-DSA-44 is advertised in the zone's DS RRset (or in
+/// its trust anchor).
+///
+/// This function returns whether the validator insists on `a` in this way.
+/// Currently that is the case for ML-DSA-44 only, and only when the
+/// `unstable-mldsa` feature is enabled.
+///
+/// [RFC 6840]: https://www.rfc-editor.org/rfc/rfc6840#section-5.11
+/// [draft-westerbaan-dnssec-mldsa]: https://datatracker.ietf.org/doc/draft-westerbaan-dnssec-mldsa/
+pub fn insisted_algorithm(a: &SecurityAlgorithm) -> bool {
+    #[cfg(feature = "unstable-mldsa")]
+    if *a == SecurityAlgorithm::MLDSA44 {
+        return true;
+    }
+    #[cfg(not(feature = "unstable-mldsa"))]
+    let _ = a;
+    false
+}
+
 //============ Test ==========================================================
 
 #[cfg(test)]

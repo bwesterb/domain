@@ -17,6 +17,11 @@ Unstable features
   as described in draft-westerbaan-dnssec-mldsa, using the pure-Rust
   `ml-dsa` crate as backend. The DNSSEC algorithm number used (18) is
   provisional until IANA assigns one.
+* When a zone's DS RRset (or trust anchor) advertises ML-DSA-44, the
+  validator insists on valid ML-DSA-44 signatures instead of accepting any
+  single valid path, preventing the algorithm downgrade attack described
+  in the Security Considerations of draft-westerbaan-dnssec-mldsa.
+  (Requires the `unstable-mldsa` feature.)
 
 Other changes
 

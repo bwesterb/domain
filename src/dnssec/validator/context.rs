@@ -5,7 +5,9 @@
 //! or evaluated results.
 
 use super::anchor::{TrustAnchor, TrustAnchors};
-use super::base::{DnskeyExt, supported_algorithm, supported_digest};
+use super::base::{
+    DnskeyExt, insisted_algorithm, supported_algorithm, supported_digest,
+};
 use super::group::{Group, GroupSet, SigCache, ValidatedGroup};
 use super::nsec::{
     Nsec3Cache, Nsec3NXState, Nsec3State, NsecNXState, NsecState,
@@ -1148,6 +1150,24 @@ impl<Upstream> ValidationContext<Upstream> {
             ));
         }
 
+        // If the authenticated DS RRset advertises an algorithm the
+        // validator insists on (currently ML-DSA-44, see
+        // 'insisted_algorithm'), then only accept a chain of trust through
+        // such an algorithm to prevent the downgrade attack described in
+        // the Security Considerations of draft-westerbaan-dnssec-mldsa.
+        let insist = tmp_group
+            .rr_iter()
+            .map(|r| {
+                if let AllRecordData::Ds(ds) = r.data() {
+                    (ds.algorithm(), ds.digest_type())
+                } else {
+                    panic!("DS record expected");
+                }
+            })
+            .any(|(alg, dig)| {
+                insisted_algorithm(&alg) && supported_digest(&dig)
+            });
+
         // Get the DNSKEY RRset.
         let (mut answers, _, ede) =
             request_as_groups(&self.upstream, &name, Rtype::DNSKEY).await?;
@@ -1206,6 +1226,7 @@ impl<Upstream> ValidationContext<Upstream> {
             .filter(|ds| {
                 supported_algorithm(&ds.algorithm())
                     && supported_digest(&ds.digest_type())
+                    && (!insist || insisted_algorithm(&ds.algorithm()))
             })
         {
             let r_dnskey = match find_key_for_ds(ds, dnskey_group) {
@@ -1251,13 +1272,15 @@ impl<Upstream> ValidationContext<Upstream> {
                     let sig_ttl = ttl_for_sig(sig).into_duration();
                     let ttl = min(ttl, sig_ttl);
 
-                    return Ok(Node::new_delegation(
+                    let mut node = Node::new_delegation(
                         key_name,
                         ValidationState::Secure,
                         dnskey_vec,
                         None,
                         ttl,
-                    ));
+                    );
+                    node.set_insist(insist);
+                    return Ok(node);
                 } else {
                     // To avoid CPU exhaustion attacks such as KeyTrap
                     // (CVE-2023-50387) it is good to limit signature
@@ -1309,7 +1332,14 @@ impl<Upstream> ValidationContext<Upstream> {
         // totest, no DNSKEY without signatures
         // totest, DNSKEY with 1 failing signatures
         if ede.is_none() {
-            ede = make_ede(ExtendedErrorCode::DNSSEC_BOGUS, "No signature");
+            ede = if insist {
+                make_ede(
+                    ExtendedErrorCode::DNSSEC_BOGUS,
+                    "No valid signature with insisted algorithm",
+                )
+            } else {
+                make_ede(ExtendedErrorCode::DNSSEC_BOGUS, "No signature")
+            };
         }
         Ok(Node::new_delegation(
             name,
@@ -1428,6 +1458,18 @@ pub(crate) struct Node {
     /// Whether this node is a delegation or an intermediate node.
     intermediate: bool,
 
+    /// Whether the validator insists on signatures made with an algorithm
+    /// for which [`insisted_algorithm`] returns true (currently ML-DSA-44)
+    /// for RRsets signed by this node's zone.
+    ///
+    /// This is set when the zone's authenticated DS RRset (or its trust
+    /// anchor) advertises such an algorithm, and prevents the algorithm
+    /// downgrade attack described in the Security Considerations of
+    /// [draft-westerbaan-dnssec-mldsa].
+    ///
+    /// [draft-westerbaan-dnssec-mldsa]: https://datatracker.ietf.org/doc/draft-westerbaan-dnssec-mldsa/
+    insist: bool,
+
     /// An optional extended error. Mostly for the bogus state.
     ede: Option<ExtendedError<Vec<u8>>>,
 
@@ -1454,6 +1496,7 @@ impl Node {
             keys: Vec::new(),
             signer_name: name,
             intermediate: false,
+            insist: false,
             ede,
             created_at: Instant::now(),
             valid_for,
@@ -1500,9 +1543,34 @@ impl Node {
         let mut bad_sigs = 0;
         let mut opt_ede: Option<ExtendedError<Vec<u8>>> = None;
 
+        // If the trust anchor advertises an algorithm the validator insists
+        // on (currently ML-DSA-44, see 'insisted_algorithm'), then only
+        // accept a chain of trust through such an algorithm to prevent
+        // downgrade attacks.
+        let insist = (*ta).clone().iter().any(|rr| match rr.data() {
+            ZoneRecordData::Dnskey(key) => {
+                insisted_algorithm(&key.algorithm())
+            }
+            ZoneRecordData::Ds(ds) => {
+                insisted_algorithm(&ds.algorithm())
+                    && supported_digest(&ds.digest_type())
+            }
+            _ => false,
+        });
+
         // Try to find one trust anchor key that can be used to validate
         // the DNSKEY RRset.
         for ta_rr in (*ta).clone().iter() {
+            if insist {
+                let algorithm = match ta_rr.data() {
+                    ZoneRecordData::Dnskey(key) => key.algorithm(),
+                    ZoneRecordData::Ds(ds) => ds.algorithm(),
+                    _ => continue,
+                };
+                if !insisted_algorithm(&algorithm) {
+                    continue;
+                }
+            }
             let opt_dnskey_rr = if ta_rr.rtype() == Rtype::DNSKEY {
                 has_key(dnskeys, ta_rr)
             } else if ta_rr.rtype() == Rtype::DS {
@@ -1547,6 +1615,7 @@ impl Node {
                         keys: Vec::new(),
                         signer_name: ta_owner,
                         intermediate: false,
+                        insist,
                         ede: None,
                         created_at: Instant::now(),
                         valid_for: ttl,
@@ -1604,8 +1673,14 @@ impl Node {
         // totest, no DNSKEY without signatures for trust anchor
         // totest, DNSKEY with 1 failing signatures for trust anchor
         if opt_ede.is_none() {
-            opt_ede =
-                make_ede(ExtendedErrorCode::DNSSEC_BOGUS, "No signature");
+            opt_ede = if insist {
+                make_ede(
+                    ExtendedErrorCode::DNSSEC_BOGUS,
+                    "No valid signature with insisted algorithm",
+                )
+            } else {
+                make_ede(ExtendedErrorCode::DNSSEC_BOGUS, "No signature")
+            };
         }
         Ok(Node::new_delegation(
             ta_owner,
@@ -1629,6 +1704,7 @@ impl Node {
             signer_name,
             keys,
             intermediate: false,
+            insist: false,
             ede,
             created_at: Instant::now(),
             valid_for,
@@ -1648,10 +1724,25 @@ impl Node {
             signer_name,
             keys: Vec::new(),
             intermediate: true,
+            insist: false,
             ede,
             created_at: Instant::now(),
             valid_for,
         }
+    }
+
+    /// Return whether the validator insists on signatures made with an
+    /// algorithm for which [`insisted_algorithm`] returns true (currently
+    /// ML-DSA-44) for RRsets signed by this node's zone.
+    pub fn insist(&self) -> bool {
+        self.insist
+    }
+
+    /// Set whether the validator insists on signatures made with an
+    /// algorithm for which [`insisted_algorithm`] returns true for RRsets
+    /// signed by this node's zone.
+    pub fn set_insist(&mut self, value: bool) {
+        self.insist = value;
     }
 
     /// Get the validation state.

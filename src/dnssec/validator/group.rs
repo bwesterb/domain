@@ -20,7 +20,7 @@ use crate::base::{Name, ParsedName, ParsedRecord, Record, Rtype, Ttl};
 use crate::crypto::common::{DigestBuilder, DigestType};
 use crate::dep::octseq::builder::with_infallible;
 use crate::dep::octseq::{Octets, OctetsFrom};
-use crate::dnssec::validator::base::RrsigExt;
+use crate::dnssec::validator::base::{RrsigExt, insisted_algorithm};
 use crate::net::client::request::{RequestMessage, SendRequest};
 use crate::rdata::dnssec::Timestamp;
 use crate::rdata::{AllRecordData, Dnskey, Rrsig};
@@ -454,6 +454,15 @@ impl Group {
         for sig_rec in self.clone().sig_iter() {
             let sig = sig_rec.data();
             for key in keys {
+                // If the zone advertises an algorithm the validator insists
+                // on (currently ML-DSA-44, see 'insisted_algorithm'), then
+                // only accept signatures made with such an algorithm. Any
+                // other signature could be forged, see the Security
+                // Considerations of draft-westerbaan-dnssec-mldsa.
+                if node.insist() && !insisted_algorithm(&key.algorithm()) {
+                    continue;
+                }
+
                 // See if this key matches the sig.
                 if key.algorithm() != sig.algorithm() {
                     continue;
@@ -537,8 +546,14 @@ impl Group {
         }
 
         if opt_ede.is_none() {
-            opt_ede =
-                make_ede(ExtendedErrorCode::DNSSEC_BOGUS, "No signature");
+            opt_ede = if node.insist() {
+                make_ede(
+                    ExtendedErrorCode::DNSSEC_BOGUS,
+                    "No valid signature with insisted algorithm",
+                )
+            } else {
+                make_ede(ExtendedErrorCode::DNSSEC_BOGUS, "No signature")
+            };
         }
         (
             ValidationState::Bogus,
@@ -1038,5 +1053,212 @@ impl SigCache {
         Self {
             cache: Cache::new(size),
         }
+    }
+}
+
+//============ Tests =========================================================
+
+/// Tests for the algorithm downgrade protection described in the Security
+/// Considerations of draft-westerbaan-dnssec-mldsa.
+#[cfg(all(
+    test,
+    feature = "unstable-mldsa",
+    feature = "unstable-crypto-sign",
+    any(feature = "ring", feature = "openssl")
+))]
+mod tests {
+    use super::*;
+    use crate::base::iana::SecurityAlgorithm;
+    use crate::base::{Message, MessageBuilder};
+    use crate::crypto::mldsa::test_vectors;
+    use crate::crypto::sign::{
+        GenerateParams, KeyPair, SecretKeyBytes, SignRaw, generate,
+    };
+    use crate::dnssec::validator::context::Node;
+    use crate::rdata::Mx;
+    use core::str::FromStr;
+    use core::time::Duration;
+
+    type TestName = Name<Vec<u8>>;
+    type TestRrsig = Rrsig<Vec<u8>, TestName>;
+
+    /// The apex of the test zone.
+    fn signer_name() -> TestName {
+        TestName::from_str("example.com.").unwrap()
+    }
+
+    /// The MX record from the draft's example.
+    fn mx() -> Record<TestName, Mx<TestName>> {
+        Record::new(
+            signer_name(),
+            Class::IN,
+            Ttl::from_secs(3600),
+            Mx::new(10, TestName::from_str("mail.example.com.").unwrap()),
+        )
+    }
+
+    /// An ML-DSA-44 key pair (from the draft's example) and an Ed25519
+    /// key pair, as for a zone that is signed with both algorithms.
+    fn keys() -> (KeyPair, KeyPair) {
+        let secret =
+            SecretKeyBytes::parse_from_bind(test_vectors::PRIVATE_KEY)
+                .unwrap();
+        let mldsa_key =
+            KeyPair::from_bytes(&secret, &test_vectors::dnskey()).unwrap();
+
+        let (secret, public) =
+            generate(&GenerateParams::Ed25519, 257).unwrap();
+        let ed_key = KeyPair::from_bytes(&secret, &public).unwrap();
+
+        (mldsa_key, ed_key)
+    }
+
+    /// Sign the MX RRset with the given key.
+    fn sign_mx(key: &KeyPair) -> Record<TestName, TestRrsig> {
+        // In test builds 'Timestamp::now' uses a mocked clock that starts
+        // at zero, so the inception cannot be put in the past.
+        let now = Timestamp::now().into_int();
+        let inception = Timestamp::from(now);
+        let expiration = Timestamp::from(now.wrapping_add(86400));
+
+        let rrsig = |signature| {
+            Rrsig::new(
+                Rtype::MX,
+                key.algorithm(),
+                2,
+                Ttl::from_secs(3600),
+                expiration,
+                inception,
+                key.dnskey().key_tag(),
+                signer_name(),
+                signature,
+            )
+            .unwrap()
+        };
+
+        let mut signed_data = Vec::new();
+        rrsig(Vec::new())
+            .signed_data(&mut signed_data, &mut [mx()])
+            .unwrap();
+        let signature = key.sign_raw(&signed_data).unwrap();
+
+        Record::new(
+            signer_name(),
+            Class::IN,
+            Ttl::from_secs(3600),
+            rrsig(signature.as_ref().to_vec()),
+        )
+    }
+
+    /// Validate the MX RRset with the given signatures against a node
+    /// holding the zone's keys, insisting on ML-DSA-44 or not.
+    async fn validate(
+        keys: &[&KeyPair],
+        sigs: &[Record<TestName, TestRrsig>],
+        insist: bool,
+    ) -> ValidationState {
+        // Build a message to parse the records from.
+        let mut builder = MessageBuilder::new_vec().answer();
+        builder.push(mx()).unwrap();
+        for sig in sigs {
+            builder.push(sig).unwrap();
+        }
+        let msg = builder.into_message();
+        let msg =
+            Message::from_octets(Bytes::copy_from_slice(msg.as_slice()))
+                .unwrap();
+
+        let mut groups = GroupSet::new();
+        for rr in msg.answer().unwrap() {
+            groups.add(rr.unwrap()).unwrap();
+        }
+        let group = groups.iter().next().unwrap();
+
+        // Build a node with the zone's DNSKEY RRset.
+        let keys = keys
+            .iter()
+            .map(|k| {
+                let k = k.dnskey();
+                Dnskey::new(
+                    k.flags(),
+                    k.protocol(),
+                    k.algorithm(),
+                    Bytes::copy_from_slice(k.public_key().as_ref()),
+                )
+                .unwrap()
+            })
+            .collect();
+        let mut node = Node::new_delegation(
+            signer_name().to_name::<Bytes>(),
+            ValidationState::Secure,
+            keys,
+            None,
+            Duration::from_secs(300),
+        );
+        node.set_insist(insist);
+
+        let sig_cache = SigCache::new(100);
+        let (state, _, _, _, _) = group
+            .validate_with_node(&node, &sig_cache, &Config::new())
+            .await;
+        state
+    }
+
+    #[tokio::test]
+    async fn insist_mldsa() {
+        let (mldsa_key, ed_key) = keys();
+        let keys = [&mldsa_key, &ed_key];
+        let mldsa_sig = sign_mx(&mldsa_key);
+        let ed_sig = sign_mx(&ed_key);
+        assert_eq!(mldsa_key.algorithm(), SecurityAlgorithm::MLDSA44);
+
+        // A tampered ML-DSA-44 signature, as a quantum attacker might
+        // produce.
+        let mut bad_mldsa_sig = mldsa_sig.clone();
+        let mut sig_bytes = bad_mldsa_sig.data().signature().to_vec();
+        sig_bytes[0] ^= 1;
+        *bad_mldsa_sig.data_mut() = Rrsig::new(
+            Rtype::MX,
+            mldsa_sig.data().algorithm(),
+            mldsa_sig.data().labels(),
+            mldsa_sig.data().original_ttl(),
+            mldsa_sig.data().expiration(),
+            mldsa_sig.data().inception(),
+            mldsa_sig.data().key_tag(),
+            mldsa_sig.data().signer_name().clone(),
+            sig_bytes,
+        )
+        .unwrap();
+
+        // A dual-signed RRset validates, whether the validator insists on
+        // ML-DSA-44 or not.
+        let sigs = [mldsa_sig.clone(), ed_sig.clone()];
+        let state = validate(&keys, &sigs, false).await;
+        assert_eq!(state, ValidationState::Secure);
+        let state = validate(&keys, &sigs, true).await;
+        assert_eq!(state, ValidationState::Secure);
+
+        // An RRset signed with ML-DSA-44 alone validates.
+        let sigs = [mldsa_sig.clone()];
+        let state = validate(&keys, &sigs, true).await;
+        assert_eq!(state, ValidationState::Secure);
+
+        // A lenient validator accepts the Ed25519 signature alone, even
+        // though the ML-DSA-44 signature is stripped or tampered with.
+        let state =
+            validate(&keys, core::slice::from_ref(&ed_sig), false).await;
+        assert_eq!(state, ValidationState::Secure);
+        let sigs = [bad_mldsa_sig.clone(), ed_sig.clone()];
+        let state = validate(&keys, &sigs, false).await;
+        assert_eq!(state, ValidationState::Secure);
+
+        // A validator that insists on ML-DSA-44 rejects the downgrade to
+        // the Ed25519 signature alone.
+        let state =
+            validate(&keys, core::slice::from_ref(&ed_sig), true).await;
+        assert_eq!(state, ValidationState::Bogus);
+        let sigs = [bad_mldsa_sig, ed_sig];
+        let state = validate(&keys, &sigs, true).await;
+        assert_eq!(state, ValidationState::Bogus);
     }
 }
