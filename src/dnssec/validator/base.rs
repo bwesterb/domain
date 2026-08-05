@@ -126,6 +126,10 @@ where
                 // EdDSA public key sizes are measured in encoded form.
                 Ok(self.public_key().as_ref().len() * 8)
             }
+            SecurityAlgorithm::MLDSA44 => {
+                // ML-DSA-44 public key sizes are measured in encoded form.
+                Ok(self.public_key().as_ref().len() * 8)
+            }
             _ => Err(AlgorithmError::Unsupported),
         }
     }
@@ -315,6 +319,11 @@ impl<Octets: AsRef<[u8]>, TN: ToName> RrsigExt for Rrsig<Octets, TN> {
 /// Report whether an algorithm is supported or not.
 // This needs to match the algorithms supported in signed_data.
 pub fn supported_algorithm(a: &SecurityAlgorithm) -> bool {
+    #[cfg(feature = "unstable-mldsa")]
+    if *a == SecurityAlgorithm::MLDSA44 {
+        return true;
+    }
+
     *a == SecurityAlgorithm::RSASHA1
         || *a == SecurityAlgorithm::RSASHA1_NSEC3_SHA1
         || *a == SecurityAlgorithm::RSASHA256
@@ -690,6 +699,104 @@ mod test {
         let (dnskey, _) = root_pubkey();
         let owner = Name::root();
         assert!(dnskey.digest(&owner, DigestAlgorithm::GOST).is_err());
+    }
+
+    /// Tests with the example from draft-westerbaan-dnssec-mldsa-03,
+    /// Section 6.
+    #[cfg(feature = "unstable-mldsa")]
+    mod mldsa44 {
+        use super::*;
+        use crate::crypto::mldsa::test_vectors;
+        use crate::utils::base16;
+
+        /// The example RRSIG over the example MX RRset.
+        fn rrsig() -> Rrsig {
+            Rrsig::new(
+                Rtype::MX,
+                SecurityAlgorithm::MLDSA44,
+                2,
+                Ttl::from_secs(3600),
+                1440021600.into(),
+                1438207200.into(),
+                59829,
+                Name::from_str("example.com.").unwrap(),
+                base64::decode::<Vec<u8>>(test_vectors::SIGNATURE_B64)
+                    .unwrap(),
+            )
+            .unwrap()
+        }
+
+        /// The signed data for the example MX RRset.
+        fn signed_data(rrsig: &Rrsig) -> Bytes {
+            let record = Record::new(
+                Name::from_str("example.com.").unwrap(),
+                Class::IN,
+                Ttl::from_secs(3600),
+                Mx::new(10, Name::from_str("mail.example.com.").unwrap()),
+            );
+            let mut buf = Vec::new();
+            rrsig.signed_data(&mut buf, &mut [record]).unwrap();
+            Bytes::from(buf)
+        }
+
+        #[test]
+        fn rrsig_verify_mldsa44() {
+            let dnskey = test_vectors::dnskey();
+            let rrsig = rrsig();
+            assert_eq!(dnskey.key_tag(), rrsig.key_tag());
+
+            let signed_data = signed_data(&rrsig);
+            assert_eq!(
+                rrsig.verify_signed_data(&dnskey, &signed_data),
+                Ok(())
+            );
+
+            // Modified data must not verify.
+            let mut bad_data = signed_data.to_vec();
+            bad_data[0] ^= 1;
+            assert_eq!(
+                rrsig.verify_signed_data(&dnskey, &bad_data),
+                Err(AlgorithmError::BadSig)
+            );
+        }
+
+        #[cfg(feature = "unstable-crypto-sign")]
+        #[test]
+        fn rrsig_sign_mldsa44() {
+            use crate::crypto::sign::{KeyPair, SecretKeyBytes, SignRaw};
+
+            let dnskey = test_vectors::dnskey();
+            let secret =
+                SecretKeyBytes::parse_from_bind(test_vectors::PRIVATE_KEY)
+                    .unwrap();
+            let key = KeyPair::from_bytes(&secret, &dnskey).unwrap();
+
+            // Deterministic ML-DSA reproduces the signature from the
+            // draft's example.
+            let rrsig = rrsig();
+            let signed_data = signed_data(&rrsig);
+            let signature = key.sign_raw(signed_data.as_ref()).unwrap();
+            assert_eq!(signature.as_ref(), rrsig.signature().as_slice());
+        }
+
+        #[test]
+        fn dnskey_digest_mldsa44() {
+            let owner = Name::from_str("example.com.").unwrap();
+            let expected =
+                base16::decode_vec(test_vectors::DS_DIGEST_HEX).unwrap();
+            assert_eq!(
+                test_vectors::dnskey()
+                    .digest(&owner, DigestAlgorithm::SHA256)
+                    .unwrap()
+                    .as_ref(),
+                expected
+            );
+        }
+
+        #[test]
+        fn key_size_mldsa44() {
+            assert_eq!(test_vectors::dnskey().key_size(), Ok(1312 * 8));
+        }
     }
 
     const KEYS: &[(SecurityAlgorithm, u16, usize)] = &[

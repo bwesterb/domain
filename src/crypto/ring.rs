@@ -498,7 +498,7 @@ pub mod sign {
                     .map(|k| Self::Ed25519(k, public.flags()))
                 }
 
-                SecretKeyBytes::Ed448(_) => {
+                SecretKeyBytes::Ed448(_) | SecretKeyBytes::MlDsa44(_) => {
                     Err(FromBytesError::UnsupportedAlgorithm)
                 }
             }

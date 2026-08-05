@@ -89,6 +89,9 @@ use crate::base::iana::SecurityAlgorithm;
 use crate::rdata::Dnskey;
 use crate::utils::base64;
 
+#[cfg(feature = "unstable-mldsa")]
+use super::mldsa;
+
 #[cfg(feature = "openssl")]
 use super::openssl;
 
@@ -132,6 +135,15 @@ pub enum GenerateParams {
 
     /// An Ed448 keypair.
     Ed448,
+
+    /// Generate an ML-DSA-44 keypair.
+    ///
+    /// This algorithm is described in [draft-westerbaan-dnssec-mldsa] and
+    /// uses a provisional algorithm number; see
+    /// [`SecurityAlgorithm::MLDSA44`].
+    ///
+    /// [draft-westerbaan-dnssec-mldsa]: https://datatracker.ietf.org/doc/draft-westerbaan-dnssec-mldsa/
+    MlDsa44,
 }
 
 //--- Inspection
@@ -146,6 +158,7 @@ impl GenerateParams {
             Self::EcdsaP384Sha384 => SecurityAlgorithm::ECDSAP384SHA384,
             Self::Ed25519 => SecurityAlgorithm::ED25519,
             Self::Ed448 => SecurityAlgorithm::ED448,
+            Self::MlDsa44 => SecurityAlgorithm::MLDSA44,
         }
     }
 }
@@ -239,6 +252,9 @@ pub enum Signature {
 
     /// Signature using Ed448.
     Ed448(Box<[u8; 114]>),
+
+    /// Signature using ML-DSA-44.
+    MlDsa44(Box<[u8; 2420]>),
 }
 
 impl Signature {
@@ -255,6 +271,7 @@ impl Signature {
             Self::EcdsaP384Sha384(_) => SecurityAlgorithm::ECDSAP384SHA384,
             Self::Ed25519(_) => SecurityAlgorithm::ED25519,
             Self::Ed448(_) => SecurityAlgorithm::ED448,
+            Self::MlDsa44(_) => SecurityAlgorithm::MLDSA44,
         }
     }
 }
@@ -270,6 +287,7 @@ impl AsRef<[u8]> for Signature {
             Self::EcdsaP384Sha384(s) => &**s,
             Self::Ed25519(s) => &**s,
             Self::Ed448(s) => &**s,
+            Self::MlDsa44(s) => &**s,
         }
     }
 }
@@ -285,6 +303,7 @@ impl From<Signature> for Box<[u8]> {
             Signature::EcdsaP384Sha384(s) => s as _,
             Signature::Ed25519(s) => s as _,
             Signature::Ed448(s) => s as _,
+            Signature::MlDsa44(s) => s as _,
         }
     }
 }
@@ -308,6 +327,10 @@ pub enum KeyPair {
     /// A key backed by OpenSSL.
     #[cfg(feature = "openssl")]
     OpenSSL(openssl::sign::KeyPair),
+
+    /// An ML-DSA-44 key backed by the pure-Rust `ml-dsa` crate.
+    #[cfg(feature = "unstable-mldsa")]
+    MlDsa(mldsa::sign::KeyPair),
 }
 
 //--- Conversion to and from bytes
@@ -328,6 +351,13 @@ impl KeyPair {
         // need to specify a default error.
         #[allow(unused_mut)] // occurs if a single backend is enabled
         let mut error;
+
+        // ML-DSA-44 is only supported by its own backend.
+        #[cfg(feature = "unstable-mldsa")]
+        if let SecretKeyBytes::MlDsa44(_) = secret {
+            return mldsa::sign::KeyPair::from_bytes(secret, public)
+                .map(Self::MlDsa);
+        }
 
         // Prefer Ring if it is available.
         #[cfg(feature = "ring")]
@@ -373,6 +403,8 @@ impl SignRaw for KeyPair {
             Self::Ring(key) => key.algorithm(),
             #[cfg(feature = "openssl")]
             Self::OpenSSL(key) => key.algorithm(),
+            #[cfg(feature = "unstable-mldsa")]
+            Self::MlDsa(key) => key.algorithm(),
         }
     }
 
@@ -382,6 +414,8 @@ impl SignRaw for KeyPair {
             Self::Ring(key) => key.dnskey(),
             #[cfg(feature = "openssl")]
             Self::OpenSSL(key) => key.dnskey(),
+            #[cfg(feature = "unstable-mldsa")]
+            Self::MlDsa(key) => key.dnskey(),
         }
     }
 
@@ -391,6 +425,8 @@ impl SignRaw for KeyPair {
             Self::Ring(key) => key.sign_raw(data),
             #[cfg(feature = "openssl")]
             Self::OpenSSL(key) => key.sign_raw(data),
+            #[cfg(feature = "unstable-mldsa")]
+            Self::MlDsa(key) => key.sign_raw(data),
         }
     }
 }
@@ -409,6 +445,12 @@ pub fn generate(
     // need to specify a default error.
     #[allow(unused_mut)] // occurs if a single backend is enabled
     let mut error;
+
+    // ML-DSA-44 is only supported by its own backend.
+    #[cfg(feature = "unstable-mldsa")]
+    if let GenerateParams::MlDsa44 = params {
+        return mldsa::sign::generate(params, flags);
+    }
 
     // Prefer Ring if it is available.
     #[cfg(feature = "ring")]
@@ -491,6 +533,8 @@ pub fn generate(
 ///   - `14 (ECDSAP384SHA384)`: ECDSA with the P-384 curve and SHA-384 digest.
 ///   - `15 (ED25519)`: Ed25519.
 ///   - `16 (ED448)`: Ed448.
+///   - `18 (MLDSA44)`: ML-DSA-44.  Note that this algorithm number is
+///     provisional; see [`SecurityAlgorithm::MLDSA44`].
 ///
 /// The value of every following entry is a Base64-encoded string of variable
 /// length, using the RFC 4648 variant (i.e. with `+` and `/`, and `=` for
@@ -515,6 +559,9 @@ pub fn generate(
 ///   interpreted as a big-endian integer.
 ///
 /// - For EdDSA, the private scalar of the key, as a fixed-width byte string.
+///
+/// - For ML-DSA-44, the 32-byte seed from which the key pair is derived, as
+///   described in FIPS 204, section 3.6.3.
 #[derive(Debug)]
 pub enum SecretKeyBytes {
     /// An RSA/SHA-256 keypair.
@@ -542,6 +589,11 @@ pub enum SecretKeyBytes {
     ///
     /// The private key is a single 57-byte string.
     Ed448(SecretBox<[u8; 57]>),
+
+    /// An ML-DSA-44 keypair.
+    ///
+    /// The private key is the 32-byte seed the key pair is derived from.
+    MlDsa44(SecretBox<[u8; 32]>),
 }
 
 //--- Inspection
@@ -556,6 +608,7 @@ impl SecretKeyBytes {
             Self::EcdsaP384Sha384(_) => SecurityAlgorithm::ECDSAP384SHA384,
             Self::Ed25519(_) => SecurityAlgorithm::ED25519,
             Self::Ed448(_) => SecurityAlgorithm::ED448,
+            Self::MlDsa44(_) => SecurityAlgorithm::MLDSA44,
         }
     }
 }
@@ -602,6 +655,14 @@ impl SecretKeyBytes {
             Self::Ed448(s) => {
                 let s = s.expose_secret();
                 writeln!(w, "Algorithm: 16 (ED448)")?;
+                writeln!(w, "PrivateKey: {}", base64::encode_display(s))
+            }
+
+            Self::MlDsa44(s) => {
+                // NOTE: The algorithm number for ML-DSA-44 is provisional;
+                // see 'SecurityAlgorithm::MLDSA44'.
+                let s = s.expose_secret();
+                writeln!(w, "Algorithm: 18 (MLDSA44)")?;
                 writeln!(w, "PrivateKey: {}", base64::encode_display(s))
             }
         }
@@ -695,6 +756,7 @@ impl SecretKeyBytes {
             }
             (15, "(ED25519)") => parse_pkey(data).map(Self::Ed25519),
             (16, "(ED448)") => parse_pkey(data).map(Self::Ed448),
+            (18, "(MLDSA44)") => parse_pkey(data).map(Self::MlDsa44),
             _ => Err(BindFormatError::UnsupportedAlgorithm),
         }
     }

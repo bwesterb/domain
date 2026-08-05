@@ -54,6 +54,9 @@ use core::fmt;
 
 use crate::rdata::Dnskey;
 
+#[cfg(feature = "unstable-mldsa")]
+use super::mldsa;
+
 #[cfg(feature = "openssl")]
 use super::openssl;
 
@@ -166,6 +169,11 @@ pub enum PublicKey {
     /// A public key implemented using openssl.
     #[cfg(feature = "openssl")]
     Openssl(openssl::PublicKey),
+
+    /// An ML-DSA-44 public key, implemented using the pure-Rust `ml-dsa`
+    /// crate.
+    #[cfg(feature = "unstable-mldsa")]
+    MlDsa(mldsa::PublicKey),
 }
 
 impl PublicKey {
@@ -174,6 +182,14 @@ impl PublicKey {
     pub fn from_dnskey(
         dnskey: &Dnskey<impl AsRef<[u8]>>,
     ) -> Result<Self, AlgorithmError> {
+        // Neither Ring nor OpenSSL supports ML-DSA-44, so it is handled by
+        // its own backend.
+        #[cfg(feature = "unstable-mldsa")]
+        if dnskey.algorithm() == crate::base::iana::SecurityAlgorithm::MLDSA44
+        {
+            return Ok(Self::MlDsa(mldsa::PublicKey::from_dnskey(dnskey)?));
+        }
+
         #[cfg(feature = "ring")]
         return Ok(Self::Ring(ring::PublicKey::from_dnskey(dnskey)?));
 
@@ -199,6 +215,10 @@ impl PublicKey {
             }
             #[cfg(feature = "openssl")]
             PublicKey::Openssl(public_key) => {
+                public_key.verify(signed_data, signature)
+            }
+            #[cfg(feature = "unstable-mldsa")]
+            PublicKey::MlDsa(public_key) => {
                 public_key.verify(signed_data, signature)
             }
         }

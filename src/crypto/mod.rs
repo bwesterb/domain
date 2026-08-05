@@ -93,6 +93,16 @@
 #![cfg_attr(feature = "unstable-crypto-backend", doc = "[`common`]")]
 #![cfg_attr(not(feature = "unstable-crypto-backend"), doc = "`common`")]
 //! module.
+//!
+//! In addition, the `unstable-mldsa` feature enables the
+#![cfg_attr(feature = "unstable-mldsa", doc = "[`mldsa`]")]
+#![cfg_attr(not(feature = "unstable-mldsa"), doc = "`mldsa`")]
+//! backend, which provides experimental support for the post-quantum
+//! signature scheme ML-DSA-44 as described in
+//! [draft-westerbaan-dnssec-mldsa].  It complements the Ring and OpenSSL
+//! backends, at least one of which needs to be enabled as well.
+//!
+//! [draft-westerbaan-dnssec-mldsa]: https://datatracker.ietf.org/doc/draft-westerbaan-dnssec-mldsa/
 
 #![cfg(feature = "unstable-crypto")]
 #![cfg_attr(docsrs, doc(cfg(feature = "unstable-crypto")))]
@@ -100,6 +110,7 @@
 #![warn(clippy::missing_docs_in_private_items)]
 
 pub mod common;
+pub mod mldsa;
 pub mod openssl;
 pub mod ring;
 pub mod sign;

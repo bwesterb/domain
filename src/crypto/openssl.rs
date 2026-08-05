@@ -558,6 +558,10 @@ pub mod sign {
                     }
                 }
 
+                SecretKeyBytes::MlDsa44(_) => {
+                    return Err(FromBytesError::UnsupportedAlgorithm);
+                }
+
                 SecretKeyBytes::Ed448(s) => {
                     use openssl::memcmp;
 
@@ -836,6 +840,9 @@ pub mod sign {
             }
             GenerateParams::Ed25519 => PKey::generate_ed25519()?,
             GenerateParams::Ed448 => PKey::generate_ed448()?,
+            GenerateParams::MlDsa44 => {
+                return Err(GenerateError::UnsupportedAlgorithm);
+            }
         };
 
         Ok(KeyPair {

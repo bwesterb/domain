@@ -12,6 +12,12 @@ Bug fixes
 
 Unstable features
 
+* New `unstable-mldsa` feature that enables experimental support for
+  signing and validation with the post-quantum signature scheme ML-DSA-44
+  as described in draft-westerbaan-dnssec-mldsa, using the pure-Rust
+  `ml-dsa` crate as backend. The DNSSEC algorithm number used (18) is
+  provisional until IANA assigns one.
+
 Other changes
 
 
