@@ -38,13 +38,24 @@
 #![cfg(feature = "unstable-crypto-backend")]
 // NOTE: Users should not interact with the `unstable-crypto-backend` feature
 // directly, we deliberately show them the features they should use instead.
-#![cfg_attr(docsrs, doc(cfg(any(feature = "ring", feature = "openssl"))))]
+#![cfg_attr(
+    docsrs,
+    doc(cfg(any(
+        feature = "ring",
+        feature = "openssl",
+        feature = "mldsa"
+    )))
+)]
 
-// Fail if 'ring' or 'openssl' is not enabled.
+// Fail if no cryptographic backend is enabled.
 const _: () = {
     assert!(
-        cfg!(any(feature = "ring", feature = "openssl")),
-        "Do not enable the 'unstable-crypto-backend' feature directly, enable 'ring' or 'openssl' instead",
+        cfg!(any(
+            feature = "ring",
+            feature = "openssl",
+            feature = "mldsa"
+        )),
+        "Do not enable the 'unstable-crypto-backend' feature directly, enable 'ring', 'openssl' or 'mldsa' instead",
     );
 };
 
@@ -54,7 +65,7 @@ use core::fmt;
 
 use crate::rdata::Dnskey;
 
-#[cfg(feature = "unstable-mldsa")]
+#[cfg(feature = "mldsa")]
 use super::mldsa;
 
 #[cfg(feature = "openssl")]
@@ -93,6 +104,10 @@ pub enum DigestBuilder {
     /// Use openssl to compute the message digest.
     #[cfg(feature = "openssl")]
     Openssl(openssl::DigestBuilder),
+    /// Use BoringSSL (from the `mldsa` backend) to compute the message
+    /// digest.
+    #[cfg(feature = "mldsa")]
+    Boring(mldsa::DigestBuilder),
 }
 
 impl DigestBuilder {
@@ -104,6 +119,9 @@ impl DigestBuilder {
 
         #[cfg(feature = "openssl")]
         return Self::Openssl(openssl::DigestBuilder::new(digest_type));
+
+        #[cfg(feature = "mldsa")]
+        return Self::Boring(mldsa::DigestBuilder::new(digest_type));
     }
 
     /// Add input to the digest computation.
@@ -115,6 +133,10 @@ impl DigestBuilder {
             }
             #[cfg(feature = "openssl")]
             DigestBuilder::Openssl(digest_context) => {
+                digest_context.update(data)
+            }
+            #[cfg(feature = "mldsa")]
+            DigestBuilder::Boring(digest_context) => {
                 digest_context.update(data)
             }
         }
@@ -131,6 +153,10 @@ impl DigestBuilder {
             DigestBuilder::Openssl(digest_context) => {
                 Digest::Openssl(digest_context.finish())
             }
+            #[cfg(feature = "mldsa")]
+            DigestBuilder::Boring(digest_context) => {
+                Digest::Boring(digest_context.finish())
+            }
         }
     }
 }
@@ -145,6 +171,9 @@ pub enum Digest {
     /// A message digest computed using openssl.
     #[cfg(feature = "openssl")]
     Openssl(openssl::Digest),
+    /// A message digest computed using BoringSSL.
+    #[cfg(feature = "mldsa")]
+    Boring(mldsa::Digest),
 }
 
 impl AsRef<[u8]> for Digest {
@@ -154,6 +183,8 @@ impl AsRef<[u8]> for Digest {
             Digest::Ring(digest) => digest.as_ref(),
             #[cfg(feature = "openssl")]
             Digest::Openssl(digest) => digest.as_ref(),
+            #[cfg(feature = "mldsa")]
+            Digest::Boring(digest) => digest.as_ref(),
         }
     }
 }
@@ -170,9 +201,8 @@ pub enum PublicKey {
     #[cfg(feature = "openssl")]
     Openssl(openssl::PublicKey),
 
-    /// An ML-DSA-44 public key, implemented using the pure-Rust `ml-dsa`
-    /// crate.
-    #[cfg(feature = "unstable-mldsa")]
+    /// An ML-DSA-44 public key, implemented using BoringSSL.
+    #[cfg(feature = "mldsa")]
     MlDsa(mldsa::PublicKey),
 }
 
@@ -184,7 +214,7 @@ impl PublicKey {
     ) -> Result<Self, AlgorithmError> {
         // Neither Ring nor OpenSSL supports ML-DSA-44, so it is handled by
         // its own backend.
-        #[cfg(feature = "unstable-mldsa")]
+        #[cfg(feature = "mldsa")]
         if dnskey.algorithm() == crate::base::iana::SecurityAlgorithm::MLDSA44
         {
             return Ok(Self::MlDsa(mldsa::PublicKey::from_dnskey(dnskey)?));
@@ -196,9 +226,21 @@ impl PublicKey {
         #[cfg(all(feature = "openssl", not(feature = "ring")))]
         return Ok(Self::Openssl(openssl::PublicKey::from_dnskey(dnskey)?));
 
-        #[cfg(not(any(feature = "ring", feature = "openssl")))]
+        // With only the mldsa backend, all other algorithms are
+        // unsupported.
+        #[cfg(all(
+            feature = "mldsa",
+            not(any(feature = "ring", feature = "openssl"))
+        ))]
+        return Err(AlgorithmError::Unsupported);
+
+        #[cfg(not(any(
+            feature = "ring",
+            feature = "openssl",
+            feature = "mldsa"
+        )))]
         compile_error!(
-            "Either feature \"ring\" or \"openssl\" must be enabled for this crate."
+            "Either feature \"ring\", \"openssl\" or \"mldsa\" must be enabled for this crate."
         );
     }
 
@@ -217,7 +259,7 @@ impl PublicKey {
             PublicKey::Openssl(public_key) => {
                 public_key.verify(signed_data, signature)
             }
-            #[cfg(feature = "unstable-mldsa")]
+            #[cfg(feature = "mldsa")]
             PublicKey::MlDsa(public_key) => {
                 public_key.verify(signed_data, signature)
             }

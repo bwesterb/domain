@@ -319,7 +319,7 @@ impl<Octets: AsRef<[u8]>, TN: ToName> RrsigExt for Rrsig<Octets, TN> {
 /// Report whether an algorithm is supported or not.
 // This needs to match the algorithms supported in signed_data.
 pub fn supported_algorithm(a: &SecurityAlgorithm) -> bool {
-    #[cfg(feature = "unstable-mldsa")]
+    #[cfg(feature = "mldsa")]
     if *a == SecurityAlgorithm::MLDSA44 {
         return true;
     }
@@ -349,16 +349,16 @@ pub fn supported_algorithm(a: &SecurityAlgorithm) -> bool {
 ///
 /// This function returns whether the validator insists on `a` in this way.
 /// Currently that is the case for ML-DSA-44 only, and only when the
-/// `unstable-mldsa` feature is enabled.
+/// `mldsa` feature (enabled by default) is on.
 ///
 /// [RFC 6840]: https://www.rfc-editor.org/rfc/rfc6840#section-5.11
 /// [draft-westerbaan-dnssec-mldsa]: https://datatracker.ietf.org/doc/draft-westerbaan-dnssec-mldsa/
 pub fn insisted_algorithm(a: &SecurityAlgorithm) -> bool {
-    #[cfg(feature = "unstable-mldsa")]
+    #[cfg(feature = "mldsa")]
     if *a == SecurityAlgorithm::MLDSA44 {
         return true;
     }
-    #[cfg(not(feature = "unstable-mldsa"))]
+    #[cfg(not(feature = "mldsa"))]
     let _ = a;
     false
 }
@@ -735,7 +735,7 @@ mod test {
 
     /// Tests with the example from draft-westerbaan-dnssec-mldsa-03,
     /// Section 6.
-    #[cfg(feature = "unstable-mldsa")]
+    #[cfg(feature = "mldsa")]
     mod mldsa44 {
         use super::*;
         use crate::crypto::mldsa::test_vectors;
@@ -803,12 +803,27 @@ mod test {
                     .unwrap();
             let key = KeyPair::from_bytes(&secret, &dnskey).unwrap();
 
-            // Deterministic ML-DSA reproduces the signature from the
-            // draft's example.
+            // Signing is hedged, so the signature differs from the
+            // draft's example, but it must verify.
             let rrsig = rrsig();
             let signed_data = signed_data(&rrsig);
             let signature = key.sign_raw(signed_data.as_ref()).unwrap();
-            assert_eq!(signature.as_ref(), rrsig.signature().as_slice());
+            let rrsig = Rrsig::new(
+                rrsig.type_covered(),
+                rrsig.algorithm(),
+                rrsig.labels(),
+                rrsig.original_ttl(),
+                rrsig.expiration(),
+                rrsig.inception(),
+                rrsig.key_tag(),
+                rrsig.signer_name().clone(),
+                signature.as_ref().to_vec(),
+            )
+            .unwrap();
+            assert_eq!(
+                rrsig.verify_signed_data(&dnskey, &signed_data),
+                Ok(())
+            );
         }
 
         #[test]

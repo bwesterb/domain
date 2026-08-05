@@ -5,36 +5,30 @@
 //! believed to be secure even against adversaries in possession of a
 //! cryptographically relevant quantum computer.
 //!
-//! This backend implements ML-DSA-44 using the pure-Rust [`ml_dsa`] crate.
-//! It complements the Ring and OpenSSL backends, which do not support
-//! ML-DSA; one of those backends still needs to be enabled for message
-//! digests and the other signature algorithms.
+//! This backend implements ML-DSA-44 using BoringSSL, through the
+//! [`boring`] and [`boring_sys`] crates.  It complements the Ring and
+//! OpenSSL backends, which do not support ML-DSA.  This backend also
+//! provides message digests, so it can be used on its own.
 //!
 //! Signatures are generated and verified using the "pure" ML-DSA variant
 //! with an empty context string, as required by the draft.  Signing uses
-//! the deterministic variant of ML-DSA, so signing the same data with the
-//! same key always produces the same signature.
-//!
-//! <div class="warning">
-//!
-//! No DNSSEC algorithm number has been assigned to ML-DSA-44 by IANA yet.
-//! This module uses the example code point 18 used by the draft's test
-//! vectors, which will change once IANA assigns a number.  Do not use
-//! ML-DSA-44 in production zones yet.
-//!
-//! </div>
+//! the hedged variant of ML-DSA, so signing the same data twice produces
+//! different (but equally valid) signatures.
 //!
 //! [draft-westerbaan-dnssec-mldsa]: https://datatracker.ietf.org/doc/draft-westerbaan-dnssec-mldsa/
 //! [FIPS 204]: https://doi.org/10.6028/NIST.FIPS.204
 
-#![cfg(feature = "unstable-mldsa")]
-#![cfg_attr(docsrs, doc(cfg(feature = "unstable-mldsa")))]
+#![cfg(feature = "mldsa")]
+#![cfg_attr(docsrs, doc(cfg(feature = "mldsa")))]
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use core::fmt;
+#[cfg(feature = "unstable-crypto-sign")]
+use core::mem::MaybeUninit;
+use core::ptr::null;
 
-use ml_dsa::MlDsa44;
-
-use super::common::AlgorithmError;
+use super::common::{AlgorithmError, DigestType};
 use crate::base::iana::SecurityAlgorithm;
 use crate::rdata::Dnskey;
 
@@ -47,13 +41,169 @@ pub const SIGNATURE_SIZE: usize = 2420;
 /// The size of the seed an ML-DSA-44 private key is derived from.
 pub const SEED_SIZE: usize = 32;
 
+/// Bindings for the ML-DSA-44 API in BoringSSL's `openssl/mldsa.h`, which
+/// the `boring-sys` crate does not currently generate.
+mod ffi {
+    #![allow(non_camel_case_types)]
+    #![allow(missing_docs)]
+    // The private key functionality is only used for signing.
+    #![cfg_attr(not(feature = "unstable-crypto-sign"), allow(dead_code))]
+
+    use boring_sys::{CBB, CBS};
+    use core::ffi::c_int;
+
+    /// The size of `struct MLDSA44_private_key` in `openssl/mldsa.h`.
+    const PRIVATE_KEY_REPR_SIZE: usize =
+        (32 + 64 + 256 * 4 * 4) + 32 + 256 * 4 * (4 + 4 + 4);
+
+    /// The size of `struct MLDSA44_public_key` in `openssl/mldsa.h`.
+    const PUBLIC_KEY_REPR_SIZE: usize = 32 + 64 + 256 * 4 * 4;
+
+    /// BoringSSL's `struct MLDSA44_private_key`.
+    ///
+    /// The contents are opaque; the format is unstable.
+    #[derive(Clone)]
+    #[repr(C, align(4))]
+    pub(super) struct MLDSA44_private_key {
+        /// The unstable internal representation.
+        opaque: [u8; PRIVATE_KEY_REPR_SIZE],
+    }
+
+    /// BoringSSL's `struct MLDSA44_public_key`.
+    ///
+    /// The contents are opaque; the format is unstable.
+    #[derive(Clone)]
+    #[repr(C, align(4))]
+    pub(super) struct MLDSA44_public_key {
+        /// The unstable internal representation.
+        opaque: [u8; PUBLIC_KEY_REPR_SIZE],
+    }
+
+    unsafe extern "C" {
+        pub(super) fn MLDSA44_generate_key(
+            out_encoded_public_key: *mut u8,
+            out_seed: *mut u8,
+            out_private_key: *mut MLDSA44_private_key,
+        ) -> c_int;
+
+        pub(super) fn MLDSA44_private_key_from_seed(
+            out_private_key: *mut MLDSA44_private_key,
+            seed: *const u8,
+            seed_len: usize,
+        ) -> c_int;
+
+        pub(super) fn MLDSA44_public_from_private(
+            out_public_key: *mut MLDSA44_public_key,
+            private_key: *const MLDSA44_private_key,
+        ) -> c_int;
+
+        pub(super) fn MLDSA44_sign(
+            out_encoded_signature: *mut u8,
+            private_key: *const MLDSA44_private_key,
+            msg: *const u8,
+            msg_len: usize,
+            context: *const u8,
+            context_len: usize,
+        ) -> c_int;
+
+        pub(super) fn MLDSA44_verify(
+            public_key: *const MLDSA44_public_key,
+            signature: *const u8,
+            signature_len: usize,
+            msg: *const u8,
+            msg_len: usize,
+            context: *const u8,
+            context_len: usize,
+        ) -> c_int;
+
+        pub(super) fn MLDSA44_marshal_public_key(
+            out: *mut CBB,
+            public_key: *const MLDSA44_public_key,
+        ) -> c_int;
+
+        pub(super) fn MLDSA44_parse_public_key(
+            public_key: *mut MLDSA44_public_key,
+            in_: *mut CBS,
+        ) -> c_int;
+    }
+}
+
+/// Serialize a parsed public key into its standard encoding.
+#[cfg(feature = "unstable-crypto-sign")]
+fn marshal_public_key(
+    key: &ffi::MLDSA44_public_key,
+) -> Box<[u8; PUBLIC_KEY_SIZE]> {
+    let mut out = Box::new([0u8; PUBLIC_KEY_SIZE]);
+    // SAFETY: 'cbb' writes to the correctly sized buffer 'out' and
+    // 'key' is a valid public key.
+    unsafe {
+        let mut cbb = MaybeUninit::<boring_sys::CBB>::uninit();
+        if boring_sys::CBB_init_fixed(
+            cbb.as_mut_ptr(),
+            out.as_mut_ptr(),
+            out.len(),
+        ) != 1
+            || ffi::MLDSA44_marshal_public_key(cbb.as_mut_ptr(), key) != 1
+        {
+            unreachable!("marshaling a valid key into 1312 bytes works");
+        }
+    }
+    out
+}
+
+//----------- DigestBuilder --------------------------------------------------
+
+/// Builder for computing a message digest.
+pub struct DigestBuilder(boring::hash::Hasher);
+
+impl DigestBuilder {
+    /// Create a new builder for a specified digest type.
+    pub fn new(digest_type: DigestType) -> Self {
+        use boring::hash::{Hasher, MessageDigest};
+        Self(
+            match digest_type {
+                DigestType::Sha1 => Hasher::new(MessageDigest::sha1()),
+                DigestType::Sha256 => Hasher::new(MessageDigest::sha256()),
+                DigestType::Sha384 => Hasher::new(MessageDigest::sha384()),
+            }
+            .expect("assume that new cannot fail"),
+        )
+    }
+
+    /// Add input to the digest computation.
+    pub fn update(&mut self, data: &[u8]) {
+        self.0
+            .update(data)
+            .expect("assume that update does not fail")
+    }
+
+    /// Finish computing the digest.
+    pub fn finish(mut self) -> Digest {
+        Digest(self.0.finish().expect("assume that finish does not fail"))
+    }
+}
+
+//----------- Digest ---------------------------------------------------------
+
+/// A message digest.
+pub struct Digest(boring::hash::DigestBytes);
+
+impl AsRef<[u8]> for Digest {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_ref()
+    }
+}
+
 //----------- PublicKey ------------------------------------------------------
 
 /// An ML-DSA-44 public key for verifying a signature.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PublicKey {
-    /// The verifying key.
-    key: ml_dsa::VerifyingKey<MlDsa44>,
+    /// The parsed public key.
+    key: Box<ffi::MLDSA44_public_key>,
+
+    /// The encoded public key.
+    encoded: Box<[u8; PUBLIC_KEY_SIZE]>,
 
     /// Flags from [`Dnskey`].
     flags: u16,
@@ -67,12 +217,31 @@ impl PublicKey {
         if dnskey.algorithm() != SecurityAlgorithm::MLDSA44 {
             return Err(AlgorithmError::Unsupported);
         }
-        let enc = ml_dsa::EncodedVerifyingKey::<MlDsa44>::try_from(
-            dnskey.public_key().as_ref(),
-        )
-        .map_err(|_| AlgorithmError::InvalidData)?;
+        let encoded: Box<[u8]> = dnskey.public_key().as_ref().into();
+        let encoded: Box<[u8; PUBLIC_KEY_SIZE]> = encoded
+            .try_into()
+            .map_err(|_| AlgorithmError::InvalidData)?;
+
+        boring_sys::init();
+        let mut key = Box::<ffi::MLDSA44_public_key>::new_uninit();
+        // CBS_init is inline in BoringSSL, so construct the CBS directly.
+        let mut cbs = boring_sys::CBS {
+            data: encoded.as_ptr(),
+            len: encoded.len(),
+        };
+        // SAFETY: 'key' and 'cbs' are valid for the duration of the call.
+        if unsafe {
+            ffi::MLDSA44_parse_public_key(key.as_mut_ptr(), &mut cbs)
+        } != 1
+        {
+            return Err(AlgorithmError::InvalidData);
+        }
+        // SAFETY: 'key' was initialized by 'MLDSA44_parse_public_key'.
+        let key = unsafe { key.assume_init() };
+
         Ok(Self {
-            key: ml_dsa::VerifyingKey::decode(&enc),
+            key,
+            encoded,
             flags: dnskey.flags(),
         })
     }
@@ -83,9 +252,24 @@ impl PublicKey {
         signed_data: &[u8],
         signature: &[u8],
     ) -> Result<(), AlgorithmError> {
-        let signature = ml_dsa::Signature::<MlDsa44>::try_from(signature)
-            .map_err(|_| AlgorithmError::InvalidData)?;
-        if self.key.verify_with_context(signed_data, b"", &signature) {
+        if signature.len() != SIGNATURE_SIZE {
+            return Err(AlgorithmError::InvalidData);
+        }
+        boring_sys::init();
+        // SAFETY: all pointers are valid for the given lengths for the
+        // duration of the call.
+        let valid = unsafe {
+            ffi::MLDSA44_verify(
+                self.key.as_ref(),
+                signature.as_ptr(),
+                signature.len(),
+                signed_data.as_ptr(),
+                signed_data.len(),
+                null(),
+                0,
+            )
+        } == 1;
+        if valid {
             Ok(())
         } else {
             Err(AlgorithmError::BadSig)
@@ -98,9 +282,17 @@ impl PublicKey {
             self.flags,
             3,
             SecurityAlgorithm::MLDSA44,
-            self.key.encode().to_vec(),
+            self.encoded.to_vec(),
         )
         .expect("long enough")
+    }
+}
+
+impl fmt::Debug for PublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PublicKey")
+            .field("flags", &self.flags)
+            .finish_non_exhaustive()
     }
 }
 
@@ -109,11 +301,15 @@ impl PublicKey {
 pub mod sign {
     use alloc::boxed::Box;
     use alloc::vec::Vec;
+    use core::fmt;
+    use core::ptr::null;
 
-    use ml_dsa::{Keypair, MlDsa44, Signer};
-    use secrecy::ExposeSecret;
+    use secrecy::{ExposeSecret, SecretBox};
 
-    use super::{PublicKey, SEED_SIZE, SIGNATURE_SIZE};
+    use super::{
+        PUBLIC_KEY_SIZE, PublicKey, SEED_SIZE, SIGNATURE_SIZE, ffi,
+        marshal_public_key,
+    };
     use crate::base::iana::SecurityAlgorithm;
     use crate::crypto::sign::{
         FromBytesError, GenerateError, GenerateParams, SecretKeyBytes,
@@ -124,10 +320,15 @@ pub mod sign {
     //----------- KeyPair ----------------------------------------------------
 
     /// An ML-DSA-44 key pair.
-    #[derive(Clone, Debug)]
     pub struct KeyPair {
-        /// The signing key.
-        key: ml_dsa::SigningKey<MlDsa44>,
+        /// The private key.
+        key: Box<ffi::MLDSA44_private_key>,
+
+        /// The seed the private key is derived from.
+        seed: SecretBox<[u8; SEED_SIZE]>,
+
+        /// The encoded public key.
+        encoded_public: Box<[u8; PUBLIC_KEY_SIZE]>,
 
         /// Flags from [`Dnskey`].
         flags: u16,
@@ -148,25 +349,59 @@ pub mod sign {
                 return Err(FromBytesError::UnsupportedAlgorithm);
             };
 
-            let seed = ml_dsa::Seed::from(*seed.expose_secret());
-            let key = ml_dsa::SigningKey::<MlDsa44>::from_seed(&seed);
-            let this = Self {
-                key,
-                flags: public.flags(),
-            };
+            boring_sys::init();
+            let mut key = Box::<ffi::MLDSA44_private_key>::new_uninit();
+            // SAFETY: 'key' and the 32-byte seed are valid for the
+            // duration of the call.
+            if unsafe {
+                ffi::MLDSA44_private_key_from_seed(
+                    key.as_mut_ptr(),
+                    seed.expose_secret().as_ptr(),
+                    seed.expose_secret().len(),
+                )
+            } != 1
+            {
+                return Err(FromBytesError::Implementation);
+            }
+            // SAFETY: 'key' was initialized by
+            // 'MLDSA44_private_key_from_seed'.
+            let key = unsafe { key.assume_init() };
+
+            let mut public_key = Box::<ffi::MLDSA44_public_key>::new_uninit();
+            // SAFETY: 'public_key' and 'key' are valid for the duration of
+            // the call.
+            if unsafe {
+                ffi::MLDSA44_public_from_private(
+                    public_key.as_mut_ptr(),
+                    key.as_ref(),
+                )
+            } != 1
+            {
+                return Err(FromBytesError::Implementation);
+            }
+            // SAFETY: 'public_key' was initialized by
+            // 'MLDSA44_public_from_private'.
+            let public_key = unsafe { public_key.assume_init() };
+            let encoded_public = marshal_public_key(&public_key);
 
             // Ensure that the public and private key match.
-            if this.dnskey() != *public {
+            if public.public_key().as_ref() != encoded_public.as_slice() {
                 return Err(FromBytesError::InvalidKey);
             }
 
-            Ok(this)
+            Ok(Self {
+                key,
+                seed: SecretBox::new(Box::new(*seed.expose_secret())),
+                encoded_public,
+                flags: public.flags(),
+            })
         }
 
         /// Export the secret key into bytes.
         pub fn to_bytes(&self) -> SecretKeyBytes {
-            let seed: [u8; SEED_SIZE] = self.key.to_seed().into();
-            SecretKeyBytes::MlDsa44(Box::new(seed).into())
+            SecretKeyBytes::MlDsa44(SecretBox::new(Box::new(
+                *self.seed.expose_secret(),
+            )))
         }
     }
 
@@ -182,19 +417,42 @@ pub mod sign {
                 self.flags,
                 3,
                 SecurityAlgorithm::MLDSA44,
-                self.key.verifying_key().encode().to_vec(),
+                self.encoded_public.to_vec(),
             )
             .expect("long enough")
         }
 
         fn sign_raw(&self, data: &[u8]) -> Result<Signature, SignError> {
-            // This uses the deterministic variant of ML-DSA with an empty
-            // context string.
-            let signature = self.key.try_sign(data).map_err(|_| SignError)?;
-            let signature: Box<[u8]> = signature.encode().to_vec().into();
-            let signature: Box<[u8; SIGNATURE_SIZE]> =
-                signature.try_into().map_err(|_| SignError)?;
+            // This uses the hedged variant of ML-DSA with an empty context
+            // string.
+            let mut signature = Box::new([0u8; SIGNATURE_SIZE]);
+            boring_sys::init();
+            // SAFETY: all pointers are valid for the given lengths for the
+            // duration of the call.
+            if unsafe {
+                ffi::MLDSA44_sign(
+                    signature.as_mut_ptr(),
+                    self.key.as_ref(),
+                    data.as_ptr(),
+                    data.len(),
+                    null(),
+                    0,
+                )
+            } != 1
+            {
+                return Err(SignError);
+            }
             Ok(Signature::MlDsa44(signature))
+        }
+    }
+
+    //--- Debug
+
+    impl fmt::Debug for KeyPair {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("KeyPair")
+                .field("flags", &self.flags)
+                .finish_non_exhaustive()
         }
     }
 
@@ -209,11 +467,31 @@ pub mod sign {
             return Err(GenerateError::UnsupportedAlgorithm);
         };
 
-        use ml_dsa::Generate;
-        let key = ml_dsa::SigningKey::<MlDsa44>::try_generate()
-            .map_err(|_| GenerateError::Implementation)?;
-        let key = KeyPair { key, flags };
-        Ok((key.to_bytes(), SignRaw::dnskey(&key)))
+        boring_sys::init();
+        let mut encoded_public = Box::new([0u8; PUBLIC_KEY_SIZE]);
+        let mut seed = Box::new([0u8; SEED_SIZE]);
+        let mut key = Box::<ffi::MLDSA44_private_key>::new_uninit();
+        // SAFETY: all pointers are valid buffers of the expected sizes.
+        if unsafe {
+            ffi::MLDSA44_generate_key(
+                encoded_public.as_mut_ptr(),
+                seed.as_mut_ptr(),
+                key.as_mut_ptr(),
+            )
+        } != 1
+        {
+            return Err(GenerateError::Implementation);
+        }
+
+        let secret = SecretKeyBytes::MlDsa44(SecretBox::new(seed));
+        let public = Dnskey::new(
+            flags,
+            3,
+            SecurityAlgorithm::MLDSA44,
+            encoded_public.to_vec(),
+        )
+        .expect("long enough");
+        Ok((secret, public))
     }
 
     //--- Conversion to the public key
@@ -298,10 +576,6 @@ pub mod sign {
             assert!(
                 public.verify(b"Hello, World?", signature.as_ref()).is_err()
             );
-
-            // Signing is deterministic.
-            let same = key.sign_raw(b"Hello, World!").unwrap();
-            assert_eq!(signature, same);
         }
 
         #[test]
@@ -330,6 +604,9 @@ pub mod sign {
 /// Test vectors from Section 6 of draft-westerbaan-dnssec-mldsa-03.
 #[cfg(test)]
 pub(crate) mod test_vectors {
+    // Not all vectors are used in every feature configuration.
+    #![allow(dead_code)]
+
     use alloc::vec::Vec;
 
     use crate::base::iana::SecurityAlgorithm;
@@ -467,6 +744,8 @@ mod tests {
     #[test]
     fn from_dnskey() {
         let key = PublicKey::from_dnskey(&dnskey()).unwrap();
+        // With only the mldsa backend enabled this pattern is irrefutable.
+        #[allow(irrefutable_let_patterns)]
         let PublicKey::MlDsa(key) = key else {
             panic!("expected the ML-DSA backend to be selected");
         };

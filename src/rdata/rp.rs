@@ -256,7 +256,7 @@ impl<N: ToName> ZonefileFmt for Rp<N> {
 //============ Testing =======================================================
 
 #[cfg(test)]
-#[cfg(all(feature = "std", feature = "bytes"))]
+#[cfg(all(feature = "std", feature = "bytes", feature = "zonefile"))]
 mod test {
     use octseq::Array;
 

@@ -1062,7 +1062,7 @@ impl SigCache {
 /// Considerations of draft-westerbaan-dnssec-mldsa.
 #[cfg(all(
     test,
-    feature = "unstable-mldsa",
+    feature = "mldsa",
     feature = "unstable-crypto-sign",
     any(feature = "ring", feature = "openssl")
 ))]

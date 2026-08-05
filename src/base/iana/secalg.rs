@@ -104,10 +104,6 @@ int_enum! {
     ///
     /// This algorithm is described in [draft-westerbaan-dnssec-mldsa].
     ///
-    /// Note that no algorithm number has been assigned by IANA yet. The
-    /// value 18 is the example code point provisionally used by the
-    /// draft's test vectors and will change once IANA assigns a number.
-    ///
     /// [draft-westerbaan-dnssec-mldsa]: https://datatracker.ietf.org/doc/draft-westerbaan-dnssec-mldsa/
     (MLDSA44 => 18, "MLDSA44")
 

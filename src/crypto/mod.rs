@@ -94,13 +94,13 @@
 #![cfg_attr(not(feature = "unstable-crypto-backend"), doc = "`common`")]
 //! module.
 //!
-//! In addition, the `unstable-mldsa` feature enables the
-#![cfg_attr(feature = "unstable-mldsa", doc = "[`mldsa`]")]
-#![cfg_attr(not(feature = "unstable-mldsa"), doc = "`mldsa`")]
-//! backend, which provides experimental support for the post-quantum
-//! signature scheme ML-DSA-44 as described in
-//! [draft-westerbaan-dnssec-mldsa].  It complements the Ring and OpenSSL
-//! backends, at least one of which needs to be enabled as well.
+//! In addition, the `mldsa` feature (enabled by default) enables the
+#![cfg_attr(feature = "mldsa", doc = "[`mldsa`]")]
+#![cfg_attr(not(feature = "mldsa"), doc = "`mldsa`")]
+//! backend, which provides support for the post-quantum signature scheme
+//! ML-DSA-44 as described in [draft-westerbaan-dnssec-mldsa], implemented
+//! using BoringSSL through the `boring` crate.  It complements the Ring
+//! and OpenSSL backends, which do not support ML-DSA.
 //!
 //! [draft-westerbaan-dnssec-mldsa]: https://datatracker.ietf.org/doc/draft-westerbaan-dnssec-mldsa/
 
@@ -108,6 +108,16 @@
 #![cfg_attr(docsrs, doc(cfg(feature = "unstable-crypto")))]
 #![warn(missing_docs)]
 #![warn(clippy::missing_docs_in_private_items)]
+
+// The 'mldsa' backend links BoringSSL into the binary, which clashes with
+// OpenSSL at the linker level: both provide a library named 'crypto', and
+// BoringSSL does not provide all the symbols the 'openssl' crate needs.
+#[cfg(all(feature = "mldsa", feature = "openssl"))]
+compile_error!(
+    "The \"mldsa\" backend (BoringSSL) and the \"openssl\" backend cannot \
+    be linked into the same binary. Disable one of them; \"mldsa\" is \
+    enabled by default, so use default-features = false to disable it."
+);
 
 pub mod common;
 pub mod mldsa;

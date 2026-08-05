@@ -6,22 +6,20 @@ Breaking changes
 
 New
 
+* New `mldsa` feature, enabled by default, that adds support for signing
+  and validation with the post-quantum signature scheme ML-DSA-44 as
+  described in draft-westerbaan-dnssec-mldsa. It is implemented as a new
+  cryptographic backend using BoringSSL through the `boring` crate.
+* When a zone's DS RRset (or trust anchor) advertises ML-DSA-44, the
+  validator insists on valid ML-DSA-44 signatures instead of accepting any
+  single valid path, preventing the algorithm downgrade attack described
+  in the Security Considerations of draft-westerbaan-dnssec-mldsa.
+
 Improvements
 
 Bug fixes
 
 Unstable features
-
-* New `unstable-mldsa` feature that enables experimental support for
-  signing and validation with the post-quantum signature scheme ML-DSA-44
-  as described in draft-westerbaan-dnssec-mldsa, using the pure-Rust
-  `ml-dsa` crate as backend. The DNSSEC algorithm number used (18) is
-  provisional until IANA assigns one.
-* When a zone's DS RRset (or trust anchor) advertises ML-DSA-44, the
-  validator insists on valid ML-DSA-44 signatures instead of accepting any
-  single valid path, preventing the algorithm downgrade attack described
-  in the Security Considerations of draft-westerbaan-dnssec-mldsa.
-  (Requires the `unstable-mldsa` feature.)
 
 Other changes
 
