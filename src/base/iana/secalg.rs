@@ -103,6 +103,7 @@ int_enum! {
     /// ML-DSA-44
     ///
     /// This algorithm is described in [draft-westerbaan-dnssec-mldsa].
+    /// IANA has assigned it algorithm number 18.
     ///
     /// [draft-westerbaan-dnssec-mldsa]: https://datatracker.ietf.org/doc/draft-westerbaan-dnssec-mldsa/
     (MLDSA44 => 18, "MLDSA44")
